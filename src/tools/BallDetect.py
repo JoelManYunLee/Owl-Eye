@@ -48,19 +48,23 @@ def get_ball_position(img, original_img_=None):
         return x, y, w, h
 
 
-def ball_detect(video_path,result_path):
+def ball_detect(video_path, result_path):
     imgsz = [288, 512]
     video_name = os.path.splitext(os.path.basename(video_path))[0]
 
-
     orivi_name, start_frame = extract_numbers(video_name)
 
-    cd_save_dir= os.path.join(f"{result_path}/courts", f"court_kp")
-    cd_json_path=f"{cd_save_dir}/{orivi_name}.json"
-    court=read_json(cd_json_path)['court_info']            
-            
+    # Create an absolute and OS-safe path
+    cd_save_dir = os.path.join(result_path, "courts", "court_kp")
+    cd_json_path = os.path.join(cd_save_dir, f"{orivi_name}.json")
+    
+    # Debug check
+    if not os.path.exists(cd_json_path):
+        raise FileNotFoundError(f"Missing court keypoint JSON: {cd_json_path}")
 
-    d_save_dir = os.path.join(result_path, f"loca_info/{orivi_name}")
+    court = read_json(cd_json_path)["court_info"]
+
+    d_save_dir = os.path.join(f"{result_path}/ball", f"loca_info/{orivi_name}")
     f_source = str(video_path)
 
     if not os.path.exists(d_save_dir):
@@ -186,7 +190,7 @@ def ball_detect(video_path,result_path):
             pbar.update(1)
 
     # denoise file save path
-    dd_save_dir = os.path.join(result_path, f"loca_info(denoise)/{orivi_name}")
+    dd_save_dir = os.path.join(f"{result_path}/ball", f"loca_info(denoise)/{orivi_name}")
     os.makedirs(dd_save_dir, exist_ok=True)
 
     # json_path = f"{d_save_dir}/{video_name}.json"

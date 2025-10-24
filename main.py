@@ -217,7 +217,7 @@ for root, dirs, files in os.walk(folder_path):
                         if ext.lower() in ['.mp4']:
                             res_video_path = os.path.join(res_root, res_file)
                             print(res_video_path)
-                            ball_detect(res_video_path, f"{result_path}/ball")
+                            ball_detect(res_video_path, result_path)
                 print("-" * 10 + "End Badminton Detection" + "-" * 10)
             except KeyboardInterrupt:
                 print("Caught exception type on main.py ball_detect:",
