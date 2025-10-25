@@ -48,7 +48,13 @@ python src/tools/FrameSelect.py --folder_path "videos"
 
 # Run the following code for player, court ,net detect.
 
-Process only unprocessed video.
+Process a single video file
+
+```
+python main.py --file_path "videos/<REPLACE WITH YOUR VIDEO>" --result_path "res" 
+```
+
+Process only unprocessed videos.
 
 ```
 python main.py --folder_path "videos" --result_path "res" 
@@ -60,9 +66,14 @@ Force processing of all videos, including those that have already been processed
 python main.py --folder_path "videos" --result_path "res" --force
 ```
 
-# Draw the court,  net, and players
+# Draw the court, net, and players
 
-Process only unprocessed video.
+Process a single video file with all annotations enabled
+```
+python src/tools/VideoDraw.py --file_path "videos/<REPLACE WITH YOUR VIDEO>" --result_path "res" --court --net --players --ball --trajectory
+```
+
+Process only unprocessed videos.
 
 ```
 python src/tools/VideoDraw.py --folder_path "videos" --result_path "res" --court --net --players --ball
