@@ -1,9 +1,11 @@
 # SoloShuttlePose Usage & Examples
 Here, we first list the flags and other parameters you can tune. Default parameters work well and you don't need to tune them unless you know what you are doing.
 
-# Flags 
+# Flags
 
---folder_path: Folder path of the video to be processed. 
+--file_path: File path of the video to be processed.
+
+--folder_path: Folder path of the video to be processed. Used for processing multiple videos. 
 
 --result_path: Save paths for detection and drawing results. 
 
