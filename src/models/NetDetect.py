@@ -30,7 +30,7 @@ class NetDetect(object):
         self.normal_net_info = None
 
     def setup_RCNN(self):
-        self.__net_kpRCNN = torch.load('src/models/weights/net_kpRCNN.pth')
+        self.__net_kpRCNN = torch.load('src/models/weights/net_kpRCNN.pth', weights_only=False)
         self.__net_kpRCNN.to(self.device).eval()
 
     def del_RCNN(self):
