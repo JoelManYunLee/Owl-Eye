@@ -30,6 +30,7 @@ class NetDetect(object):
         self.normal_net_info = None
 
     def setup_RCNN(self):
+        # map_location=torch.device("mps"), weights_only=False   : This is for Mac
         self.__net_kpRCNN = torch.load('src/models/weights/net_kpRCNN.pth')
         self.__net_kpRCNN.to(self.device).eval()
 
