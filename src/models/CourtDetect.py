@@ -31,6 +31,7 @@ class CourtDetect(object):
         self.normal_court_info = None
 
     def setup_RCNN(self):
+        # map_location=torch.device("mps"), weights_only=False   : This is for Mac
         self.__court_kpRCNN = torch.load('src/models/weights/court_kpRCNN.pth')
         self.__court_kpRCNN.to(self.device).eval()
 
