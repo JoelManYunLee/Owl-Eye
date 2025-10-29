@@ -17,6 +17,7 @@ class PoseDetect:
         self.got_info = False
 
     def setup_RCNN(self):
+        # map_location=torch.device("mps"), weights_only=False   : This is for Mac
         self.__pose_kpRCNN = torch.load('src/models/weights/pose_kpRCNN.pth')
         self.__pose_kpRCNN.to(self.device).eval()
 
