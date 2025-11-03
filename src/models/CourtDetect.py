@@ -398,3 +398,18 @@ class CourtDetect(object):
             return True
         else:
             return False
+
+    def get_homography_corners(self, court_info=None):
+        '''
+        Extract the 4 corner points for homography computation from court_info.
+        court_info is a list of 6 points: [tl, tr, ml, mr, bl, br]
+        Returns the 4 corners: [tl, tr, bl, br] or None if invalid.
+        '''
+        if court_info is None:
+            court_info = self.normal_court_info
+        
+        if court_info is None or len(court_info) < 6:
+            return None
+        
+        # Extract corners: indices 0=tl, 1=tr, 4=bl, 5=br
+        return [court_info[0], court_info[1], court_info[4], court_info[5]]
