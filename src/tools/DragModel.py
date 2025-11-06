@@ -41,7 +41,7 @@ class DragModel:
             court_info[3], # middle-right
             court_info[4], # top-left
             court_info[5], # top-right
-            net_info[0],   # netpole bottom-left
+            net_info[1],   # netpole bottom-left
             net_info[2]   # netpole bottom-right
         ], dtype=np.float32)
 
@@ -105,74 +105,58 @@ class DragModel:
         return velocities
     
     @staticmethod
-    def estimate_z_position(file_path_court, X, y_pixel):
+    def estimate_z_position(file_path_court, x_pixel, y_pixel):
         """ 
-        Estimate the Z-position (height) of the shuttlecock based on its horizontal position (X)
-        and vertical pixel position (y_pixel), using the net poles as scale references.
+        Estimate the Z-position (height) of the shuttlecock using pole references.
         """
         court_data = DragModel.load_data(file_path_court)
         if court_data is None:
-            return None, None
+            return None
 
-        net_info = court_data["net_info"] # access net info
-        net_pole_data = {
-            "Z_net": 1.55, # Height of the net in meters
-            "y_BL": net_info[0][1], # y-pixel of Bottom Left Pole (Z=0)
-            "y_TL": net_info[1][1], # y-pixel of Top Left Pole (Z=1.55m)
-            "y_BR": net_info[2][1], # y-pixel of Bottom Right Pole (Z=0)
-            "y_TR": net_info[3][1], # y-pixel of Top Right Pole (Z=1.55m)
-            "X_Left": 0.0, # World X-coord of Left Pole
-            "X_Right": 6.1 # World X-coord of Right Pole
-        }
-
-        Z_net = net_pole_data["Z_net"]
+        net_info = court_data["net_info"]
         
-        # 1. Calculate vertical pixel distance for each pole in pixels
-        dy_left = abs(net_pole_data["y_BL"] - net_pole_data["y_TL"])
-        dy_right = abs(net_pole_data["y_BR"] - net_pole_data["y_TR"])
-
-        # 2. Calculate Z-scale (meters/pixel) at each pole's location
+        left_top_pixel = net_info[0]    
+        left_bottom_pixel = net_info[1] 
+        right_bottom_pixel = net_info[2]   
+        right_top_pixel = net_info[3] 
+        
+        Z_net = 1.55  # Net height in meters (standard badminton net height)
+        
+        # Calculate pixel distance in video frame
+        dy_left = abs(left_bottom_pixel[1] - left_top_pixel[1])
+        dy_right = abs(right_bottom_pixel[1] - right_top_pixel[1])
+        
+        if dy_left == 0 or dy_right == 0:
+            return 0.0
+        
+        # Calculate scale factors (meters per pixel in vertical direction)
         scale_Z_left = Z_net / dy_left
         scale_Z_right = Z_net / dy_right
-
-        # 3. Choose the closest pole's vertical scale based on the shuttlecock's X-coordinate
-        X_Left = net_pole_data["X_Left"]
-        X_Right = net_pole_data["X_Right"]
         
-        # Simple interpolation factor based on X-position
-        # This assumes a linear change in vertical perspective between the two poles.
-        interp_factor = (X - X_Left) / (X_Right - X_Left)
+        # Interpolate scale based on horizontal position
+        # Use x-pixel to determine which pole is closer
+        x_left = left_bottom_pixel[0]
+        x_right = right_bottom_pixel[0]
         
-        # Ensure factor is clamped between 0 and 1
-        interp_factor = np.clip(interp_factor, 0.0, 1.0) 
+        if x_right != x_left:
+            interp_factor = np.clip((x_pixel - x_left) / (x_right - x_left), 0.0, 1.0)
+        else:
+            interp_factor = 0.5
         
-        # Interpolate the Z-scale factor
         scale_Z = (1 - interp_factor) * scale_Z_left + interp_factor * scale_Z_right
         
-        # 4. Estimate Z-position
-        # The height is proportional to the difference between the shuttlecock's y-pixel
-        # and the y-pixel of the net line (Z=0 at Y=6.7m) at that same X-position.
+        # Interpolate the ground-level y-pixel at the shuttlecock's x-position
+        y_ground_at_x = (1 - interp_factor) * left_bottom_pixel[1] + interp_factor * right_bottom_pixel[1]
         
-        # CRITICAL ASSUMPTION: We approximate the y-pixel of the net line (Z=0, Y=6.7m) 
-        # for the shuttlecock's current X position by interpolating the mid-court Y-pixels.
+        # Calculate height based on vertical pixel difference
+        # If y_pixel < y_ground_at_x, the shuttlecock is above ground (since y increases downward)
+        dy_shuttle = y_ground_at_x - y_pixel
         
-        # For simplicity, we'll use the Y-pixel of the net pole bottom (Y=6.7m, Z=0)
-        # as the reference y_pixel_ground (Y_net is the world Y-coord of the net).
-        # Since the shuttlecock is generally tracked near the net line (Y=6.7m), this works.
-        y_BL = net_pole_data["y_BL"]
-        y_BR = net_pole_data["y_BR"]
-        
-        y_pixel_ground = (1 - interp_factor) * y_BL + interp_factor * y_BR
-        
-        # The vertical distance (in pixels) from the ground plane at that X-location
-        # Since the pixel system has Y increasing DOWN, Z is proportional to (y_pixel_ground - y_pixel)
-        dy_shuttle_pixel = y_pixel_ground - y_pixel
-        
-        # If the shuttlecock is below the ground reference line (impossible), Z is 0
-        if dy_shuttle_pixel < 0:
+        if dy_shuttle < 0:
             return 0.0
-            
-        Z_est = dy_shuttle_pixel * scale_Z
+        
+        Z_est = dy_shuttle * scale_Z
+        
         return Z_est
     
     @staticmethod
@@ -217,7 +201,9 @@ class DragModel:
                 "vx_mps": vx,
                 "vy_mps": vy,
                 "vz_mps": vz,
-                "speed_mps": speed_mps
+                "speed_mps": speed_mps,
+                "Z_frame1": p1['Z'],
+                "Z_frame2": p2['Z']  
                 })
         return velocities
 
@@ -233,7 +219,7 @@ if __name__ == "__main__":
 
     print("\nShuttlecock Speed (m/s) and Time (s):")
     print("-" * 35)
-    print("Time (s) | Speed (m/s)")
+    print(f"{'Time (s)':>8} | {'Height (m)':>10} | {'Speed (m/s)':>11}")
     print("-" * 35)
     
     if velocities3D:
@@ -245,9 +231,10 @@ if __name__ == "__main__":
             start_frame = v['frame1']
             time_s = start_frame * time_per_frame
             speed = v['speed_mps']
+            height = v['Z_frame1']
             
             # Print formatted output
-            print(f"{time_s:8.3f} | {speed:9.2f}")
+            print(f"{time_s:8.3f} | {height:10.3f} | {speed:11.2f}")
             
     else:
         print("No velocities were calculated.")
