@@ -89,7 +89,7 @@ def is_point_reachable_by_pose(point, pose, epsx=1.5, epsy=1.5):
         return False
     return pose.can_reach(np.array(point), epsx=epsx, epsy=epsy)
 
-
+# TODO: @Gavin change this method if you had a better method of getting homography
 def compute_homography(court_corners, model_size=(610.0, 1340.0)):
     # court_corners expected: [tl, tr, bl, br] or 6-pt where [0]=tl, [1]=tr, [4]=bl, [5]=br
     if court_corners is None:

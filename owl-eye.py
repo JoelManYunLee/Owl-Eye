@@ -11,10 +11,11 @@ from pathlib import Path
 
 # Import your existing detection modules
 try:
-    from src.tools.utils import write_json, clear_file, is_video_detect, find_next, find_reference
+    from src.tools.utils import write_json, clear_file, is_video_detect, find_next, find_reference, read_json
     from src.tools.VideoClip import VideoClip
     from src.models.PoseDetect import PoseDetect
     from src.models.CourtDetect import CourtDetect
+    from src.models.LandingDetect import LandingDetector, joints_to_bbox
     from src.models.NetDetect import NetDetect
     from src.tools.BallDetect import ball_detect
     from tqdm import tqdm
@@ -299,6 +300,12 @@ class BadmintonChallengeSystem:
             print("-" * 10 + "Challenge Processing Complete" + "-" * 10)
             print(f"Results saved to: {self.result_path}")
             
+            # Run landing detection post-processing
+            print("\n" + "="*50)
+            print("Starting Landing Detection (In/Out Analysis)")
+            print("="*50 + "\n")
+            self.run_landing_detection(video_path, video_name)
+            
         except Exception as e:
             print(f"Error processing video: {e}")
             logging.basicConfig(filename='logs/error.log', level=logging.ERROR,
@@ -306,6 +313,201 @@ class BadmintonChallengeSystem:
             logging.error(f"Error processing {video_path}: {str(e)}")
             import traceback
             logging.error(traceback.format_exc())
+    
+    def load_ball_dict(self, video_name):
+        """Load ball detection results from JSON files."""
+        ball_dict = {}
+        root_dir = f"{self.result_path}/ball/loca_info(denoise)/{video_name}"
+        if not os.path.exists(root_dir):
+            return ball_dict
+        for res_root, _, res_files in os.walk(root_dir):
+            for res_file in res_files:
+                if res_file.lower().endswith('.json'):
+                    res_json_path = os.path.join(res_root, res_file)
+                    ball_dict.update(read_json(res_json_path))
+        return ball_dict
+    
+    def compute_net_bbox(self, net_points, padding=10):
+        """Compute bounding box around net points."""
+        if net_points is None:
+            return None
+        xs = [p[0] for p in net_points]
+        ys = [p[1] for p in net_points]
+        return [int(min(xs) - padding), int(min(ys) - padding), 
+                int(max(xs) + padding), int(max(ys) + padding)]
+    
+    def draw_timeline(self, frame, current_frame, total_frames, events, height=16):
+        """Draw timeline with event markers at bottom of frame."""
+        h, w, _ = frame.shape
+        bar_y0 = h - height
+        overlay = frame.copy()
+        
+        # Background bar
+        cv2.rectangle(overlay, (0, bar_y0), (w, h), (32, 32, 32), -1)
+        
+        # Draw event markers
+        for ev in events:
+            f = ev["frame"]
+            x = int((f / max(1, total_frames - 1)) * (w - 1))
+            color = (128, 128, 128)
+            if ev["event_type"] == "GROUND_LANDING":
+                color = (0, 200, 0) if ev.get("in_out") == "IN" else (0, 0, 200)
+            elif ev["event_type"] == "NET_HIT":
+                color = (0, 165, 255)
+            # Vertical tick
+            cv2.line(overlay, (x, bar_y0), (x, h), color, 2)
+        
+        # Draw current cursor
+        cx = int((current_frame / max(1, total_frames - 1)) * (w - 1))
+        cv2.line(overlay, (cx, bar_y0), (cx, h), (255, 255, 255), 1)
+        
+        # Blend
+        cv2.addWeighted(overlay, 0.9, frame, 0.1, 0, frame)
+        return frame
+    
+    def run_landing_detection(self, video_path, video_name):
+        """
+        Run landing detection to determine if shuttlecock landed in/out.
+        This runs after the main detection pipeline completes.
+        """
+        try:
+            # Output paths
+            out_dir = os.path.join(self.result_path, 'videos', video_name)
+            os.makedirs(out_dir, exist_ok=True)
+            out_video_path = os.path.join(out_dir, f"{video_name}_landing.mp4")
+            out_json_path = os.path.join(self.result_path, 'landings', f"{video_name}_landings.json")
+            os.makedirs(os.path.dirname(out_json_path), exist_ok=True)
+            
+            # Load required data
+            ball_dict = self.load_ball_dict(video_name)
+            players_ref = find_reference(video_name, os.path.join(self.result_path, 'players', 'player_kp'))
+            courts_ref = find_reference(video_name, os.path.join(self.result_path, 'courts', 'court_kp'))
+            
+            if players_ref is None or courts_ref is None:
+                print(f"Missing references for {video_name}. Skipping landing detection.")
+                return
+            
+            players_dict = read_json(players_ref)
+            court_ref = read_json(courts_ref)
+            court_info = court_ref.get('court_info')
+            
+            # Initialize court and net detection for homography
+            court_detect = CourtDetect()
+            net_detect = NetDetect()
+            _ = court_detect.pre_process(video_path, courts_ref)
+            _ = net_detect.pre_process(video_path, courts_ref)
+            net_points = net_detect.normal_net_info
+            net_box = self.compute_net_bbox(net_points)
+            
+            # Extract court corners for homography
+            court_corners = court_detect.get_homography_corners(court_info)
+            if court_corners is None:
+                print(f"Failed to extract court corners for {video_name}. Skipping landing detection.")
+                return
+            
+            # Video IO
+            cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(out_video_path, fourcc, fps, (width, height))
+            
+            # Initialize landing detector
+            detector = LandingDetector()
+            detector.set_homography_from_court(court_corners)
+            
+            events = []
+            
+            print("Analyzing shuttle landings...")
+            with tqdm(total=total_frames) as pbar:
+                while True:
+                    current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    # Get shuttle position
+                    shuttle_pos = None
+                    if str(current_frame) in ball_dict:
+                        b = ball_dict[str(current_frame)]
+                        if b.get('visible', 0) == 1:
+                            shuttle_pos = (int(b['x']), int(b['y']))
+                    
+                    # Get player joints and boxes
+                    joints = players_dict.get(str(current_frame))
+                    player_joints_list = []
+                    player_boxes = []
+                    if joints is not None:
+                        top_joints = joints.get('top')
+                        bottom_joints = joints.get('bottom')
+                        if top_joints is not None:
+                            player_joints_list.append(top_joints)
+                        if bottom_joints is not None:
+                            player_joints_list.append(bottom_joints)
+                        player_boxes.append(joints_to_bbox(top_joints))
+                        player_boxes.append(joints_to_bbox(bottom_joints))
+                    
+                    # Detect landing events
+                    ev = detector.update(
+                        current_frame,
+                        shuttle_pos,
+                        player_joints_list=player_joints_list if player_joints_list else None,
+                        player_boxes=player_boxes if player_boxes else None,
+                        net_box=net_box,
+                        net_points=net_points,
+                        court_corners=court_corners
+                    )
+                    
+                    if ev is not None:
+                        events.append(ev)
+                        # Visual mark on frame where event occurs
+                        color = (0, 200, 0) if ev['event_type'] == 'GROUND_LANDING' and ev.get('in_out') == 'IN' \
+                                else (0, 0, 200) if ev['event_type'] == 'GROUND_LANDING' \
+                                else (0, 165, 255) if ev['event_type'] == 'NET_HIT' \
+                                else (200, 200, 0)
+                        cv2.circle(frame, (ev['pos'][0], ev['pos'][1]), 10, color, -1)
+                    
+                    frame = self.draw_timeline(frame, current_frame, total_frames, events, height=16)
+                    writer.write(frame)
+                    pbar.update(1)
+            
+            cap.release()
+            writer.release()
+            
+            # Save results to JSON
+            in_count = sum(1 for e in events if e["event_type"] == "GROUND_LANDING" and e.get("in_out") == "IN")
+            out_count = sum(1 for e in events if e["event_type"] == "GROUND_LANDING" and e.get("in_out") == "OUT")
+            net_count = sum(1 for e in events if e["event_type"] == "NET_HIT")
+            
+            payload = {
+                "video_name": video_name,
+                "total_rallies": 1,
+                "total_landings": in_count + out_count,
+                "in_count": in_count,
+                "out_count": out_count,
+                "net_hits": net_count,
+                "landings": events,
+            }
+            
+            with open(out_json_path, 'w') as f:
+                import json
+                json.dump(payload, f, indent=4)
+            
+            print(f"\n{'='*50}")
+            print(f"Landing Detection Results:")
+            print(f"  IN: {in_count}")
+            print(f"  OUT: {out_count}")
+            print(f"  NET HITS: {net_count}")
+            print(f"  Annotated video: {out_video_path}")
+            print(f"  Results JSON: {out_json_path}")
+            print(f"{'='*50}\n")
+            
+        except Exception as e:
+            print(f"Error in landing detection: {e}")
+            import traceback
+            traceback.print_exc()
     
     def initiate_challenge(self):
         """Save buffer and process the video in a separate thread."""
