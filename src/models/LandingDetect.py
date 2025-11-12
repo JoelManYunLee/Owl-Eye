@@ -38,6 +38,7 @@ except ImportError:
 class ShuttleState:
     RISING = "RISING"
     FALLING = "FALLING"
+    AMBIGUOUS = "AMBIGUOUS"
     GROUNDED = "GROUNDED"
 
 
@@ -90,6 +91,61 @@ def is_point_reachable_by_pose(point, pose, epsx=1.5, epsy=1.5):
     return pose.can_reach(np.array(point), epsx=epsx, epsy=epsy)
 
 
+def get_player_lowest_point(joints):
+    """Get the lowest y-coordinate (highest value) from player joints (feet/ankles)."""
+    if joints is None:
+        return None
+    # Ankle indices are typically 15 (left_ankle) and 16 (right_ankle) in 17-keypoint format
+    # Also check knees (13, 14) and other lower body points
+    valid_ys = []
+    for joint in joints:
+        if joint is not None and len(joint) >= 2:
+            valid_ys.append(joint[1])
+    if len(valid_ys) == 0:
+        return None
+    # Return the maximum y (lowest on screen = closest to ground)
+    return max(valid_ys)
+
+
+def is_point_below_player(point, player_joints, threshold_px=50):
+    """Check if point is significantly below player's feet (suggesting ground landing)."""
+    if point is None or player_joints is None:
+        return False
+    player_lowest = get_player_lowest_point(player_joints)
+    if player_lowest is None:
+        return False
+    # Point is below player if its y is greater (lower on screen) by threshold
+    return point[1] > player_lowest + threshold_px
+
+
+def has_high_downward_velocity(vy_history, threshold=15.0):
+    """Check if velocity history shows high downward velocity (suggesting ground landing)."""
+    if len(vy_history) == 0:
+        return False
+    # Check if average of positive (downward) velocities exceeds threshold
+    downward_vels = [v for v in vy_history if v > 0]
+    if len(downward_vels) == 0:
+        return False
+    avg_downward = sum(downward_vels) / len(downward_vels)
+    return avg_downward > threshold
+
+
+def get_distance_from_player_bbox(point, player_joints):
+    """Get minimum distance from point to player's actual bounding box."""
+    if point is None or player_joints is None:
+        return float('inf')
+    bbox = joints_to_bbox(player_joints, padding=0)
+    if bbox is None:
+        return float('inf')
+    xmin, ymin, xmax, ymax = bbox
+    px, py = point
+    
+    # Calculate distance to bounding box
+    dx = max(xmin - px, 0, px - xmax)
+    dy = max(ymin - py, 0, py - ymax)
+    return np.sqrt(dx*dx + dy*dy)
+
+
 def compute_homography(court_corners, model_size=(610.0, 1340.0)):
     # court_corners expected: [tl, tr, bl, br] or 6-pt where [0]=tl, [1]=tr, [4]=bl, [5]=br
     if court_corners is None:
@@ -128,17 +184,97 @@ def in_model_bounds(point, model_size=(610.0, 1340.0)):
     return (x >= 0.0 and x <= model_size[0] and y >= 0.0 and y <= model_size[1])
 
 
+def classify_in_out(landing_pos, court_corners, model_size=(610.0, 1340.0)):
+    """
+    Classify if a landing position is IN or OUT of bounds.
+    
+    Args:
+        landing_pos: (x, y) position in image coordinates
+        court_corners: Four (x, y) corners of the court
+        model_size: (width, height) of the model court
+        
+    Returns:
+        "IN" or "OUT"
+    """
+    if landing_pos is None or court_corners is None:
+        return "OUT"
+    
+    H = compute_homography(court_corners, model_size)
+    if H is None:
+        return "OUT"
+    
+    top_down_pos = warp_point(landing_pos, H)
+    if top_down_pos is None:
+        return "OUT"
+    
+    return "IN" if in_model_bounds(top_down_pos, model_size) else "OUT"
+
+
+def is_in_player_reach_zone(pos, player_joints_list, epsx=1.5, epsy=2.0):
+    """
+    Check if a position is in a player's reach zone using generous parameters.
+    Used for ambiguity checking in the triage system.
+    
+    Args:
+        pos: (x, y) position to check
+        player_joints_list: List of player joint arrays
+        epsx: Horizontal reachability multiplier (default: 1.5)
+        epsy: Vertical reachability multiplier (default: 2.0)
+        
+    Returns:
+        True if position is in any player's reach zone, False otherwise
+    """
+    if pos is None or player_joints_list is None:
+        return False
+    
+    for joints in player_joints_list:
+        if joints is None:
+            continue
+        pose = joints_to_pose(joints)
+        if pose is not None and is_point_reachable_by_pose(pos, pose, epsx=epsx, epsy=epsy):
+            return True
+    
+    return False
+
+
+def is_in_clear_ground_zone(pos, player_joints_list, threshold_px=30):
+    """
+    Check if a position is in a clear ground zone (significantly below player's feet).
+    Used for triage to identify clear ground landings.
+    
+    Args:
+        pos: (x, y) position to check
+        player_joints_list: List of player joint arrays
+        threshold_px: Vertical threshold in pixels (default: 30)
+        
+    Returns:
+        True if position is clearly below any player, False otherwise
+    """
+    if pos is None or player_joints_list is None:
+        return False
+    
+    for joints in player_joints_list:
+        if joints is not None and is_point_below_player(pos, joints, threshold_px=threshold_px):
+            return True
+    
+    return False
+
+
 class LandingDetector:
-    def __init__(self, smooth_window=7, vy_window=10, model_size=(610.0, 1340.0)):
+    def __init__(self, smooth_window=7, vy_window=10, model_size=(610.0, 1340.0), min_frames_between_landings=60, look_ahead_window=5):
         self.smooth_window = smooth_window
         self.vy_window = vy_window
         self.model_size = model_size
+        self.min_frames_between_landings = min_frames_between_landings
+        self.look_ahead_window = look_ahead_window  # Configurable look-ahead window for ambiguous events
 
         self.state = ShuttleState.RISING
         self.y_buffer = deque(maxlen=32)
         self.y_smooth_prev = None
         self.vy_history = deque(maxlen=vy_window)
         self.H = None
+        self.last_landing_frame = -1  # Track last ground landing frame to prevent duplicates
+        self.ambiguous_event_data = None  # Store ambiguous event: {"frame": frame_num, "pos": (x,y)}
 
     def set_homography_from_court(self, court_corners):
         self.H = compute_homography(court_corners, self.model_size)
@@ -148,10 +284,17 @@ class LandingDetector:
         self.y_buffer.clear()
         self.y_smooth_prev = None
         self.vy_history.clear()
+        self.last_landing_frame = -1  # Reset landing frame tracking
+        self.ambiguous_event_data = None  # Clear ambiguous event data
 
     def update(self, frame_index, shuttle_pos, player_joints_list=None, player_boxes=None, net_box=None, net_points=None, court_corners=None):
         """
-        Update landing detector with frame data.
+        Update landing detector with frame data using the "Look-Ahead" method.
+        
+        Algorithm Pipeline:
+        1. Update Velocity and State (if not ambiguous)
+        2. Check for Ambiguity Resolution (Look-Ahead) - runs BEFORE impact detection
+        3. Check for New Impact (The "Triage")
         
         Args:
             frame_index: Current frame number
@@ -161,8 +304,11 @@ class LandingDetector:
             net_box: Bounding box for net (fallback)
             net_points: List of net keypoints (preferred for accurate detection)
             court_corners: Court corner points for homography
+            
+        Returns:
+            Event dict when a landing/net/player hit is detected; otherwise None
         """
-        # Returns event dict when a landing/net/player hit is detected; otherwise None
+        # Initialize homography if needed
         if self.H is None and court_corners is not None:
             self.set_homography_from_court(court_corners)
 
@@ -170,13 +316,16 @@ class LandingDetector:
         if shuttle_pos is None:
             return None
 
-        # Smooth y
+        # ============================================
+        # STEP 1: Update Velocity and State
+        # ============================================
+        # Smooth y with 7-frame rolling average
         self.y_buffer.append(shuttle_pos[1])
         y_smooth = moving_average(list(self.y_buffer), self.smooth_window)
         if y_smooth is None:
             return None
 
-        # Compute vy
+        # Compute instantaneous vertical velocity
         vy = None
         if self.y_smooth_prev is not None:
             vy = y_smooth - self.y_smooth_prev
@@ -186,61 +335,106 @@ class LandingDetector:
         if vy is None:
             return None
 
-        # Determine state
+        # Update State (if not ambiguous)
         prev_state = self.state
-        if vy < 0:
-            self.state = ShuttleState.RISING
-        elif vy > 0:
-            self.state = ShuttleState.FALLING
+        if self.state != ShuttleState.AMBIGUOUS:
+            if vy < 0:
+                self.state = ShuttleState.RISING
+            elif vy > 0:
+                self.state = ShuttleState.FALLING
 
+        # ============================================
+        # STEP 2: Check for Ambiguity Resolution (Look-Ahead)
+        # This MUST run before impact detection
+        # ============================================
+        if self.state == ShuttleState.AMBIGUOUS and self.ambiguous_event_data is not None:
+            frames_since_impact = frame_index - self.ambiguous_event_data["frame"]
+            
+            # Check if look-ahead window has passed
+            if frames_since_impact > self.look_ahead_window:
+                # Resolve the ambiguous event
+                impact_y = self.ambiguous_event_data["pos"][1]
+                current_y = y_smooth
+                
+                # If shuttle has risen significantly (10+ pixels), it was a PLAYER_HIT
+                if current_y < (impact_y - 10):
+                    # It was a PLAYER_HIT
+                    self.state = ShuttleState.RISING
+                    original_frame = self.ambiguous_event_data["frame"]
+                    original_pos = self.ambiguous_event_data["pos"]
+                    self.ambiguous_event_data = None  # Clear ambiguous event
+                    return {
+                        "frame": original_frame,
+                        "pos": [int(original_pos[0]), int(original_pos[1])],
+                        "event_type": "PLAYER_HIT",
+                        "classification": "FALSE_POSITIVE",
+                        "velocity_history": list(self.vy_history),
+                    }
+                else:
+                    # Shuttle stayed at same level, jiggled, or bounced weakly - GROUND_LANDING
+                    self.state = ShuttleState.GROUNDED
+                    original_frame = self.ambiguous_event_data["frame"]
+                    original_pos = self.ambiguous_event_data["pos"]
+                    self.ambiguous_event_data = None  # Clear ambiguous event
+                    
+                    # Check for duplicate landing
+                    if self.last_landing_frame >= 0 and original_frame - self.last_landing_frame < self.min_frames_between_landings:
+                        return None
+                    
+                    self.last_landing_frame = original_frame
+                    in_out = classify_in_out(original_pos, court_corners, self.model_size)
+                    return {
+                        "frame": original_frame,
+                        "pos": [int(original_pos[0]), int(original_pos[1])],
+                        "event_type": "GROUND_LANDING",
+                        "classification": "TRUE_POSITIVE",
+                        "in_out": in_out,
+                        "velocity_history": list(self.vy_history),
+                    }
+
+        # ============================================
+        # STEP 3: Check for New Impact (The "Triage")
+        # ============================================
         # Impact event: transition vy from >0 to <=0 while in FALLING
         impact_trigger = (prev_state == ShuttleState.FALLING and vy <= 0)
         if not impact_trigger:
             return None
 
         impact_pos = shuttle_pos
-
-        # Classify against players using Pose.can_reach() (more accurate than bbox)
-        if player_joints_list:
-            for joints in player_joints_list:
-                pose = joints_to_pose(joints)
-                if pose is not None and is_point_reachable_by_pose(impact_pos, pose, epsx=1.5, epsy=1.5):
-                    self.state = ShuttleState.RISING
-                    return {
-                        "frame": frame_index,
-                        "pos": [int(impact_pos[0]), int(impact_pos[1])],
-                        "event_type": "PLAYER_HIT",
-                        "classification": "FALSE_POSITIVE",
-                        "velocity_history": list(self.vy_history),
-                    }
-        # Fallback to bounding box check if joints unavailable
-        elif player_boxes:
+        
+        # Get context data
+        player_data = player_joints_list if player_joints_list else None
+        net_data = net_points if net_points is not None else net_box
+        
+        # Define zones for triage
+        in_player_reach_zone = False
+        in_clear_ground_zone = False
+        
+        if player_data:
+            # Check if impact is in player reach zone (generous parameters for ambiguity checking)
+            in_player_reach_zone = is_in_player_reach_zone(impact_pos, player_data, epsx=1.5, epsy=2.0)
+            # Check if impact is in clear ground zone (>30px below player's feet)
+            in_clear_ground_zone = is_in_clear_ground_zone(impact_pos, player_data, threshold_px=30)
+        
+        # Fallback to bounding boxes if joints unavailable
+        if not player_data and player_boxes:
             for box in player_boxes:
-                if box is not None and is_point_in_box(impact_pos, box, buffer_px=10):
-                    self.state = ShuttleState.RISING
-                    return {
-                        "frame": frame_index,
-                        "pos": [int(impact_pos[0]), int(impact_pos[1])],
-                        "event_type": "PLAYER_HIT",
-                        "classification": "FALSE_POSITIVE",
-                        "velocity_history": list(self.vy_history),
-                    }
-
-        # Classify against net using net_points if available (more accurate)
+                if box is not None and is_point_in_box(impact_pos, box, buffer_px=15):
+                    in_player_reach_zone = True
+                    break
+        
+        # Check if impact is near net
+        is_near_net = False
         if net_points is not None and len(net_points) >= 4:
-            # Check if point is within net polygon (using bounding box approximation)
             net_bbox = compute_net_bbox_from_points(net_points)
-            if net_bbox is not None and is_point_in_box(impact_pos, net_bbox, buffer_px=15):
-                self.state = ShuttleState.GROUNDED
-                return {
-                    "frame": frame_index,
-                    "pos": [int(impact_pos[0]), int(impact_pos[1])],
-                    "event_type": "NET_HIT",
-                    "classification": "FAULT",
-                    "velocity_history": list(self.vy_history),
-                }
-        # Fallback to net_box if net_points unavailable
-        elif net_box is not None and is_point_in_box(impact_pos, net_box, buffer_px=10):
+            if net_bbox is not None and is_point_in_box(impact_pos, net_bbox, buffer_px=10):
+                is_near_net = True
+        elif net_box is not None and is_point_in_box(impact_pos, net_box, buffer_px=8):
+            is_near_net = True
+        
+        # Run Triage Logic
+        if is_near_net:
+            # NET_HIT (Rally over)
             self.state = ShuttleState.GROUNDED
             return {
                 "frame": frame_index,
@@ -249,19 +443,31 @@ class LandingDetector:
                 "classification": "FAULT",
                 "velocity_history": list(self.vy_history),
             }
-
-        # Ground landing
-        self.state = ShuttleState.GROUNDED
-        top_down = warp_point(impact_pos, self.H)
-        in_out = "IN" if in_model_bounds(top_down, self.model_size) else "OUT"
-        return {
-            "frame": frame_index,
-            "pos": [int(impact_pos[0]), int(impact_pos[1])],
-            "event_type": "GROUND_LANDING",
-            "classification": "TRUE_POSITIVE",
-            "in_out": in_out,
-            "velocity_history": list(self.vy_history),
-        }
+        elif in_player_reach_zone and not in_clear_ground_zone:
+            # AMBIGUOUS impact - enter ambiguous state and look ahead
+            self.state = ShuttleState.AMBIGUOUS
+            self.ambiguous_event_data = {
+                "frame": frame_index,
+                "pos": impact_pos
+            }
+            return None  # Don't return event yet, wait for resolution
+        else:
+            # Clear GROUND_LANDING (far from players or clearly below them)
+            # Check for duplicate landing
+            if self.last_landing_frame >= 0 and frame_index - self.last_landing_frame < self.min_frames_between_landings:
+                return None
+            
+            self.state = ShuttleState.GROUNDED
+            self.last_landing_frame = frame_index
+            in_out = classify_in_out(impact_pos, court_corners, self.model_size)
+            return {
+                "frame": frame_index,
+                "pos": [int(impact_pos[0]), int(impact_pos[1])],
+                "event_type": "GROUND_LANDING",
+                "classification": "TRUE_POSITIVE",
+                "in_out": in_out,
+                "velocity_history": list(self.vy_history),
+            }
 
 
 def compute_net_bbox_from_points(net_points, padding=15):
