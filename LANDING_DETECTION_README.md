@@ -1,81 +1,67 @@
-## Landing Detection Algorithm
+# Landing Detection Algorithm
 
-This module detects badminton rally-ending events by identifying impact moments and classifying true ground landings as IN/OUT using a perspective transform. The algorithm uses the **"Look-Ahead" method** to accurately differentiate between player hits (rally continues) and ground landings (rally ends) by analyzing post-impact behavior.
+This module detects badminton rally-ending events by identifying impact moments and classifying true ground landings as IN/OUT using a perspective transform. The algorithm uses a **two-step approach** to accurately differentiate between player hits (rally continues) and ground landings (rally ends).
 
-### Core Principle: The "Look-Ahead" Method
+## Core Principle: Two-Step Collection and Post-Processing
 
-Instead of using conflicting heuristics to make an instant decision, this algorithm uses a **triage system**:
+The algorithm operates in two distinct phases:
 
-1. **Triage**: When an impact occurs, it's first classified:
-   - **Clear Impacts** (far from players or net) are classified immediately as `GROUND_LANDING`
-   - **Ambiguous Impacts** (near a player) are not classified. The algorithm enters an `AMBIGUOUS` state
+1. **Step 1: Collect All Potential Landing Events** (Frame-by-frame processing):
+   - Processes each frame to update velocities and state
+   - Detects all potential impact events
+   - Applies filters (Net Hit Filter, Player Hit Filter) to classify events
+   - Collects remaining events in `potential_landings` and `potential_net_hits` lists
 
-2. **Look-Ahead**: For ambiguous impacts, the algorithm "waits" for 5-10 frames (configurable)
+2. **Step 2: Find the True Landing** (Post-processing):
+   - After all frames are processed, analyzes collected events
+   - Identifies the last potential landing event
+   - Finds the first event within a cluster window (default: 60 frames)
+   - Prioritizes `NET_HIT` events if present in the final cluster
+   - Classifies the true landing as IN/OUT
 
-3. **Resolve**: It then checks the shuttle's behavior after the impact:
-   - If the shuttle **rose**, it was a `PLAYER_HIT`
-   - If the shuttle **stayed down**, it was a `GROUND_LANDING`
-
-This method correctly handles both "fast player hits" (which look like ground landings) and "slow ground landings" (which look like player hits).
+This approach ensures only one definitive rally-ending event per video, eliminating false positives.
 
 ### States
 
-- **RISING**: Shuttle is moving up ($v_y < 0$)
+- **RISING**: Shuttle is moving up ($v_y < min_serve_rise_velocity$, default: -2.0)
 - **FALLING**: Shuttle is moving down ($v_y > 0$)
-- **AMBIGUOUS**: An impact occurred near a player. The system is "looking ahead" to classify it
-- **GROUNDED**: The rally is confirmed over (ground or net hit)
 
-### Algorithm Pipeline (Per Frame)
+### Algorithm Pipeline
 
-The algorithm runs three steps every frame:
+#### Step 1: Collect All Potential Landing Events (Per Frame)
 
-#### Step 1: Update Velocity and State
-- **Get y_smooth**: Update the 7-frame rolling average of the shuttle's $y$-coordinate
-- **Get vy**: Calculate the instantaneous vertical velocity: $v_y = y_{smooth_t} - y_{smooth_{t-1}}$
-- **Update State** (if not ambiguous):
-  - If `state != AMBIGUOUS`:
-    - If $v_y < 0$: `state = RISING`
-    - If $v_y > 0$: `state = FALLING`
+For each frame, the algorithm:
 
-#### Step 2: Check for Ambiguity Resolution (Look-Ahead)
-**This logic MUST run before impact detection.**
+1. **Update Velocity and State**:
+   - **Get y_smooth**: Update the rolling average of the shuttle's $y$-coordinate using `smooth_window` (default: 7)
+   - **Get x_smooth**: Update the rolling average of the shuttle's $x$-coordinate for horizontal velocity
+   - **Get vy**: Calculate the instantaneous vertical velocity: $v_y = y_{smooth_t} - y_{smooth_{t-1}}$
+   - **Get vx**: Calculate the instantaneous horizontal velocity: $v_x = x_{smooth_t} - x_{smooth_{t-1}}$
+   - **Update State**:
+     - If $v_y < min_serve_rise_velocity$: `state = RISING` (significant upward motion)
+     - If $v_y > 0$: `state = FALLING` (downward motion)
 
-- **Check State**: IF `state == AMBIGUOUS`:
-  - **Get Time**: `frames_since_impact = current_frame - ambiguous_event_data["frame"]`
-  - **Check Time**: IF `frames_since_impact > look_ahead_window` (default: 5 frames):
-    - **Resolve**:
-      - Get the original impact y position: `impact_y = ambiguous_event_data["pos"][1]`
-      - Get the current smoothed y position: `current_y = y_smooth`
-      - **IF** `current_y < (impact_y - 10)` (shuttle has risen 10+ pixels):
-        - **Conclusion**: It was a `PLAYER_HIT`
-        - **Action**: Set `state = RISING` and clear `ambiguous_event_data`
-      - **ELSE** (shuttle stayed at same level, jiggled, or bounced weakly):
-        - **Conclusion**: It was a `GROUND_LANDING`
-        - **Action**: Set `state = GROUNDED`
-        - **Classify In/Out**: Call `classify_in_out(ambiguous_event_data["pos"], court_corners)`
-        - **Record** this event using the original frame and position
+2. **Detect Impact and Apply Filters**:
+   - **Impact Trigger**: `prev_state == FALLING AND vy <= 0`
+   - **Filter 1: Net Hit Filter**:
+     - Checks if impact position is within 15px of net keypoints
+     - Verifies shuttle is at net height (not more than 30px below net bottom)
+     - If net hit detected, adds to `potential_net_hits` list
+   - **Filter 2: Player Hit Filter**:
+     - Checks if impact is in player reach zone
+     - Calculates average horizontal velocity from `vx_history`
+     - If `avg_horizontal_speed > horizontal_hit_threshold` (default: 2.5), discards as `PLAYER_HIT`
+   - **If event passes all filters**: Adds to `potential_landings` list
 
-#### Step 3: Check for New Impact (The "Triage")
-- **Check for Impact**: IF `state == FALLING AND vy <= 0`:
-  - **Get Context**: Get `impact_pos = shuttle_pos`, `player_data`, and `net_data`
-  - **Define Zones**:
-    - `player_reach_zone`: Define a generous reachability model around the player(s) (epsx=1.5, epsy=2.0)
-    - `clear_ground_zone`: Define a zone that is clearly on the ground (>30px below player's feet)
-  - **Run Triage Logic**:
-    - **IF** `impact_pos` is near `net_points`:
-      - **Event**: `NET_HIT` (Rally over)
-      - **Action**: Set `state = GROUNDED` and record the net hit
-    - **ELSE IF** `(impact_pos is in player_reach_zone) AND (impact_pos is NOT in clear_ground_zone)`:
-      - **Event**: This is an `AMBIGUOUS` impact
-      - **Action**:
-        - Set `state = AMBIGUOUS`
-        - Store `ambiguous_event_data = {"frame": current_frame, "pos": impact_pos}`
-    - **ELSE**:
-      - **Event**: This is a clear `GROUND_LANDING` (far from players or clearly below them)
-      - **Action**:
-        - Set `state = GROUNDED`
-        - **Classify In/Out**: Call `classify_in_out(impact_pos, court_corners)`
-        - Record the ground landing
+#### Step 2: Find the True Landing (Post-Processing)
+
+After all frames are processed, `get_true_landing()` is called:
+
+1. **Combine Events**: Merges `potential_net_hits` and `potential_landings`, sorted by frame
+2. **Find Last Event**: Identifies the last potential landing event
+3. **Cluster Analysis**: Iterates backward from last event to find first event within `landing_cluster_window` (default: 60 frames)
+4. **Net Hit Prioritization**: If any `NET_HIT` events exist in the final cluster, returns the earliest one
+5. **Classify Ground Landing**: Otherwise, classifies the true landing event as `GROUND_LANDING` using `classify_in_out()`
 
 ### Inputs
 
@@ -86,20 +72,27 @@ The algorithm runs three steps every frame:
 - **net_box**: Bounding box from net keypoints (fallback if keypoints unavailable)
 - **court_corners**: 4 corners extracted via `CourtDetect.get_homography_corners()` from the 6-point `court_info` (uses indices [0,1,4,5] for top-left, top-right, bottom-left, bottom-right)
 
-### Algorithm Parameters
+## Algorithm Parameters
+
 The algorithm uses several configurable parameters that can be adjusted for different detection sensitivity:
 
-- **smooth_window**: Rolling average window for y-coordinate smoothing (default: 7)
+- **smooth_window**: Rolling average window for y-coordinate and x-coordinate smoothing (default: 7)
 - **vy_window**: Window size for velocity history (default: 10)
-- **min_frames_between_landings**: Minimum frames between ground landings to prevent duplicates (default: 60 frames ≈ 2 seconds at 30 fps)
-- **look_ahead_window**: Number of frames to wait before resolving ambiguous events (default: 5, configurable 5-10)
-- **Player reachability (for ambiguity checking)**: epsx=1.5, epsy=2.0 (generous parameters to catch all potential player hits)
-- **Clear ground zone threshold**: 30px below player's feet to classify as clear ground landing
-- **Rise detection threshold**: 10 pixels (if shuttle rises 10+ pixels after ambiguous impact, classify as PLAYER_HIT)
+- **min_serve_rise_velocity**: Minimum upward velocity to transition to RISING state (default: -2.0)
+  - Prevents false detections before the serve/rally starts
+- **horizontal_hit_threshold**: Threshold for average horizontal velocity to classify as player hit (default: 2.5)
+  - Used to filter out player hits that don't show significant vertical rise
+- **landing_cluster_window**: Window size in frames for finding true landing from cluster (default: 60)
+  - Used in post-processing to identify the first event in a cluster of potential landings
+- **Player reachability (for player hit filtering)**: reach_epsx=1.5, reach_epsy=2.0
+- **Net detection**:
+  - Distance threshold: 15px from net keypoints
+  - Vertical check: Shuttle must be within 30px below net bottom to be considered net hit
 
 ### Outputs
 
 `res/landings/{video}_landings.json`
+
 ```json
 {
   "video_name": "test1",
@@ -129,10 +122,12 @@ The algorithm uses several configurable parameters that can be adjusted for diff
 ### Event Types
 
 - **GROUND_LANDING**: True positive ground landing with `in_out` classification ("IN" or "OUT")
-  - Can be classified immediately (clear impacts) or after look-ahead resolution (ambiguous impacts)
-- **NET_HIT**: Shuttle hit the net (fault) - classified immediately when impact is near net
-- **PLAYER_HIT**: False positive - impact detected but shuttle was hit by player (filtered out)
-  - Only classified after look-ahead resolution confirms shuttle rose after impact
+  - Detected after post-processing identifies the true landing from collected potential events
+- **NET_HIT**: Shuttle hit the net (fault) - detected when impact is within 15px of net keypoints and at net height
+  - Prioritized in post-processing if present in the final landing cluster
+- **PLAYER_HIT**: Filtered out during collection phase
+  - Detected using horizontal velocity threshold (avg_horizontal_speed > 2.5)
+  - Events are discarded and not added to potential_landings list
 
 ### Helper Functions
 
@@ -141,34 +136,40 @@ The algorithm uses several configurable parameters that can be adjusted for diff
   - Transforms landing position to top-down view and checks if inside court boundaries
   - Returns "IN" or "OUT"
 
-- **`is_in_player_reach_zone(pos, player_joints_list, epsx=1.5, epsy=2.0)`**:
-  - Checks if position is in any player's reach zone using generous parameters
-  - Used for ambiguity checking in the triage system
+- **`is_in_player_reach_zone(pos, player_joints_list, reach_epsx=1.5, reach_epsy=2.0)`**:
+  - Checks if position is in any player's reach zone
+  - Used in Player Hit Filter to identify potential player hits
 
-- **`is_in_clear_ground_zone(pos, player_joints_list, threshold_px=30)`**:
-  - Checks if position is significantly below player's feet (clear ground zone)
-  - Used to identify clear ground landings that don't need look-ahead
+- **`is_point_near_net_keypoints(point, net_points, max_distance=15)`**:
+  - Checks if a point is within max_distance pixels of any net keypoint
+  - Returns True if point is close to net, False otherwise
+  - Used in Net Hit Filter for accurate net hit detection
 
-### Key Improvements: The "Look-Ahead" Method
+- **`compute_net_bbox_from_points(net_points, padding=3)`**:
+  - Computes bounding box from net keypoints with minimal padding
+  - Used to determine net height for vertical position checking
 
-The algorithm has been completely redesigned using the "Look-Ahead" method to accurately handle ambiguous situations:
+### Key Improvements: Two-Step Collection and Post-Processing
 
-1. **Triage System**: Impacts are first classified as clear or ambiguous:
-   - Clear impacts (far from players or clearly below them) are classified immediately
-   - Ambiguous impacts (near players) enter a waiting state
+The algorithm has been redesigned using a two-step approach for highly accurate, single-event rally-ending detection:
 
-2. **Look-Ahead Resolution**: For ambiguous impacts, the algorithm observes post-impact behavior:
-   - Waits 5-10 frames (configurable) before making a decision
-   - Checks if shuttle rose (PLAYER_HIT) or stayed down (GROUND_LANDING)
-   - Uses original impact frame and position for accurate event recording
+1. **Collection Phase**: All potential events are collected during frame processing:
+   - Net hits are identified using distance to net keypoints (15px threshold)
+   - Player hits are filtered using horizontal velocity analysis
+   - Remaining events are stored for post-processing
+
+2. **Post-Processing Phase**: True landing is determined from collected events:
+   - Analyzes clusters of potential landings (60-frame window)
+   - Prioritizes net hits if present in the final cluster
+   - Ensures only one definitive rally-ending event per video
 
 3. **Handles Edge Cases**:
-   - **Fast player hits**: Correctly identifies player hits that initially look like ground landings
-   - **Slow ground landings**: Correctly identifies ground landings that initially look like player hits
-   - **Net hits**: Immediately classifies net hits without ambiguity
+   - **Net hits near ground landings**: Net hits are prioritized in post-processing
+   - **Player hits with low vertical rise**: Detected using horizontal velocity threshold
+   - **Multiple potential landings**: Cluster analysis finds the true landing
 
-4. **Generous Ambiguity Detection**: Uses generous reachability parameters (epsx=1.5, epsy=2.0) to catch all potential ambiguous cases, then resolves them accurately
+4. **Horizontal Velocity Analysis**: Uses `vx` (horizontal velocity) to detect player hits that don't show significant vertical rise, improving accuracy for defensive shots
 
-5. **Duplicate filtering**: Prevents multiple detections of the same landing event
+5. **Single-Event Detection**: Post-processing ensures only one rally-ending event is returned, eliminating false positives and duplicate detections
 
 See `USAGE_LANDING_ANNOTATION.md` for how to run and visualize on video with a timeline.
