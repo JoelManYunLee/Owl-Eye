@@ -36,6 +36,66 @@ def compute_net_bbox(net_points, padding=10):
     return [int(min(xs) - padding), int(min(ys) - padding), int(max(xs) + padding), int(max(ys) + padding)]
 
 
+def draw_landing_marker(frame, landing_event):
+    """
+    Draw landing marker and IN/OUT call on the frame.
+    
+    Args:
+        frame: OpenCV frame to draw on
+        landing_event: Event dict with 'pos', 'event_type', and 'in_out' keys
+    """
+    if landing_event is None:
+        return frame
+    
+    pos = landing_event.get("pos")
+    if pos is None:
+        return frame
+    
+    x, y = int(pos[0]), int(pos[1])
+    event_type = landing_event.get("event_type", "")
+    in_out = landing_event.get("in_out", "")
+    
+    # Determine colors based on IN/OUT
+    if event_type == "GROUND_LANDING":
+        if in_out == "IN":
+            circle_color = (0, 255, 0)  # Green for IN
+            text_color = (0, 255, 0)
+            call_text = "IN"
+        else:
+            circle_color = (0, 0, 255)  # Red for OUT
+            text_color = (0, 0, 255)
+            call_text = "OUT"
+    elif event_type == "NET_HIT":
+        circle_color = (0, 165, 255)  # Orange for net hit
+        text_color = (0, 165, 255)
+        call_text = "NET"
+    else:
+        return frame
+    
+    # Draw text label at landing position
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.8
+    thickness = 2
+    
+    # Get text size for positioning
+    (text_width, text_height), baseline = cv2.getTextSize(call_text, font, font_scale, thickness)
+    
+    # Position text above the marker
+    text_x = x - text_width // 2
+    text_y = y - 30
+    
+    # Draw text background for better visibility
+    cv2.rectangle(frame, 
+                  (text_x - 5, text_y - text_height - 5),
+                  (text_x + text_width + 5, text_y + baseline + 5),
+                  (0, 0, 0), -1)
+    
+    # Draw text
+    cv2.putText(frame, call_text, (text_x, text_y), font, font_scale, text_color, thickness)
+    
+    return frame
+
+
 def draw_timeline(frame, current_frame, total_frames, events, height=16):
     h, w, _ = frame.shape
     bar_y0 = h - height
@@ -138,7 +198,8 @@ def main():
 
         events = []
 
-        with tqdm(total=total_frames) as pbar:
+        # Step 1: Collect all potential landing events by processing all frames
+        with tqdm(total=total_frames, desc="Collecting potential landings") as pbar:
             while True:
                 current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                 ret, frame = cap.read()
@@ -174,8 +235,8 @@ def main():
                 if net_points is not None:
                     current_net_points = net_points
 
-                # Pass player joints (preferred) and net points (preferred) for accurate detection
-                ev = detector.update(
+                # Process frame and collect potential landings (returns None during collection)
+                detector.update(
                     current_frame, 
                     shuttle_pos, 
                     player_joints_list=player_joints_list if player_joints_list else None,
@@ -184,15 +245,32 @@ def main():
                     net_points=current_net_points,
                     court_corners=court_corners
                 )
-                if ev is not None:
-                    events.append(ev)
-                    # Visual mark on frame where event occurs
-                    cv2.circle(frame, (ev['pos'][0], ev['pos'][1]), 10,
-                               (0, 200, 0) if ev['event_type'] == 'GROUND_LANDING' and ev.get('in_out') == 'IN'
-                               else (0, 0, 200) if ev['event_type'] == 'GROUND_LANDING'
-                               else (0, 165, 255) if ev['event_type'] == 'NET_HIT'
-                               else (200, 200, 0), -1)
 
+                pbar.update(1)
+
+        # Step 2: Find the true landing from collected potential landings
+        true_landing = detector.get_true_landing(court_corners)
+        if true_landing is not None:
+            events.append(true_landing)
+
+        # Step 3: Re-process video to annotate the true landing
+        cap.release()
+        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+        
+        with tqdm(total=total_frames, desc="Annotating video") as pbar:
+            while True:
+                current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # Draw landing marker if this is near the landing frame (show for 10 frames around landing)
+                if true_landing is not None:
+                    landing_frame = true_landing["frame"]
+                    if abs(current_frame - landing_frame) <= 10:
+                        frame = draw_landing_marker(frame, true_landing)
+
+                # Draw timeline
                 frame = draw_timeline(frame, current_frame, total_frames, events, height=16)
                 writer.write(frame)
                 pbar.update(1)
