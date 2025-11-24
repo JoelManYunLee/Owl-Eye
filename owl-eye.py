@@ -44,18 +44,21 @@ class BadmintonChallengeSystem:
         self.fps = fps
         self.buffer_size = buffer_seconds * fps
         self.result_path = result_path
-        
+
         # Initialize video capture
         self.cap = cv2.VideoCapture(camera_index)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
-        
-        # Get actual video properties
-        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-        
-        print(f"Camera initialized: {self.frame_width}x{self.frame_height} @ {self.actual_fps} FPS")
-        
+        if self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_FPS, fps)
+            
+            # Get actual video properties
+            self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            
+            print(f"Camera initialized: {self.frame_width}x{self.frame_height} @ {self.actual_fps} FPS")
+        else:
+            print("Failed to open camera")
+
         # Rolling buffer to store frames
         self.frame_buffer = deque(maxlen=self.buffer_size)
         
