@@ -1,0 +1,493 @@
+# BME 550 Final project code
+# physics based model --> for 3D simulation of trajectory for shuttleocock
+import numpy as np
+import os
+import json
+from pathlib import Path
+import sys
+from scipy.optimize import minimize
+from scipy.integrate import solve_ivp
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+
+class DragModel:
+    @staticmethod
+    def load_data(filepath):
+        # Load Json data from file to use the data from SoloShuttlePose
+        datafromFile = json.load(filepath)
+        return datafromFile
+    
+    @staticmethod
+    def pixel_to_world(DLT_P, x_pixel, y_pixel, file_path_court):
+        # Estimate Z real world
+        Z = DragModel.estimate_z_position(file_path_court, x_pixel, y_pixel)
+        
+        # Compute matrix elements for DLT as shown in our report
+        p11 = DLT_P[0,0]
+        p12 = DLT_P[0,1]
+        p13 = DLT_P[0,2]
+        p14 = DLT_P[0,3]
+        p21 = DLT_P[1,0]
+        p22 = DLT_P[1,1]
+        p23 = DLT_P[1,2]
+        p24 = DLT_P[1,3]
+        p31 = DLT_P[2,0]
+        p32 = DLT_P[2,1]
+        p33 = DLT_P[2,2]
+        p34 = DLT_P[2,3]
+        # Solve for real world X, Y using DLT with known Z (from Medium article referenced in our report)
+        A = np.array([[p11 - x_pixel*p31, p12 - x_pixel*p32],[p21 - y_pixel*p31, p22 - y_pixel*p32]])
+        b = np.array([x_pixel*p34 + x_pixel*p33*Z - p14 - p13*Z, y_pixel*p34 + y_pixel*p33*Z - p24 - p23*Z])
+        
+        # Solve for [X, Y] using DLT matrices
+        Results = np.linalg.solve(A, b)
+        X, Y = Results[0], Results[1]
+    
+        return X, Y, Z
+    
+    @staticmethod
+    def estimate_z_position(file_path_court, x_pixel, y_pixel):
+        # Estimate the height off court of shuttlecock using the vertical poles as my refeernce
+        court_data = DragModel.load_data(file_path_court) # court data from SoloShuttlePose
+        net_info = court_data["net_info"] # Net data from SoloShuttlePose
+        
+        # net info corresponding to how SoloShuttlePose saves it
+        left_top_pixel = net_info[0]    
+        left_bottom_pixel = net_info[1] 
+        right_bottom_pixel = net_info[2]   
+        right_top_pixel = net_info[3] 
+        
+        Z_netHeight = 1.55  # Net height in meters (standard badminton net height shown in Appendix A of our report)
+        
+        # Calculate pixel distance in video frame from bottom to top of poles
+        dist_left = abs(left_bottom_pixel[1] - left_top_pixel[1])
+        dist_right = abs(right_bottom_pixel[1] - right_top_pixel[1])
+        
+        # Calculate scale factors (meters/pixel in vertical direction)
+        scale_ZLeft = Z_netHeight/dist_left
+        scale_ZRight = Z_netHeight/dist_right
+        
+        # Interpolate scale based on horizontal position (using net poles as references)
+        x_left = left_bottom_pixel[0]
+        x_right = right_bottom_pixel[0]
+        
+        if x_right != x_left: # i.e., not perfectly in between poles
+            X_dist_LeftRight = np.clip((x_pixel - x_left)/(x_right - x_left), 0.0, 1.0) # tells x-position between 0 and 1 (how far from left pole to right)
+        
+        # vertical scale using the pole that is closer to the shuttlecock to give better reference
+        scale_Z = (1 - X_dist_LeftRight)*scale_ZLeft + X_dist_LeftRight*scale_ZRight
+        
+        # What ground should be at this position on court (angle makes this needed, before was getting unusual results)
+        y_ground_at_x = (1 - X_dist_LeftRight)*left_bottom_pixel[1] + X_dist_LeftRight*right_bottom_pixel[1]
+        
+        # Calculate height based on vertical pixel difference
+        # If y_pixel < y_ground_at_x, the shuttlecock is above ground (since y increases downward for this)
+        dy_shuttle = y_ground_at_x - y_pixel
+        
+        if dy_shuttle < 0:
+            return 0.0 # shuttle cant be below ground level
+        
+        Z_est = dy_shuttle * scale_Z # height estimated using pixel to metre scale
+        return Z_est
+    
+    @staticmethod
+    def get_velocity_worlds(file_path_ball, file_path_court, fps):
+        # Calculate velocity in 3D (X, Y, Z) in m/s
+        shuttlecock_data = DragModel.load_data(file_path_ball) # load shuttle data
+        frame_numbers = sorted([int(k) for k in shuttlecock_data.keys()]) # frame numbers
+
+        velocities = [] # initialize matrix
+        DLT_P = DragModel.DLT(file_path_court) # get DLT projection matrix
+        
+        positions_3D = {}
+        for frame_num in frame_numbers:
+            f = shuttlecock_data[str(frame_num)]
+            if f['visible'] == 1: # only look at frames where the shuttlecock is detected (i.e. visible)
+                xPixel, yPixel = f['x'], f['y'] # collect the pixel datapoints
+                X, Y, Z = DragModel.pixel_to_world(DLT_P, xPixel, yPixel, file_path_court) # give real world coords
+                positions_3D[frame_num] = {'X': X, 'Y': Y, 'Z': Z}
+                #print(f"Frame {frame_num}: Pixel ({x}, {y}) -> World ({X:.3f}, {Y:.3f}, {Z:.3f})") # debug print
+                
+        # Calculate velocities
+        n = len(frame_numbers)
+        for i in range(n - 1):
+            frame1_num = frame_numbers[i] # use currrent frame and next frame to do velocity calcualtion
+            frame2_num = frame_numbers[i + 1]
+
+            # Only calculate velocity if both frames were visible and consecutive (otherwise time is different)
+            if frame1_num in positions_3D and frame2_num in positions_3D:
+                dt = 1/fps # fps is typically 30 for our videos we use (time step)
+                position_1 = positions_3D[frame1_num]
+                position_2 = positions_3D[frame2_num]
+                
+                # Component velocities for x, y, and z (see our report for directions)
+                velo_X = (position_2['X'] - position_1['X']) / dt
+                velo_Y = (position_2['Y'] - position_1['Y']) / dt
+                velo_Z = (position_2['Z'] - position_1['Z']) / dt
+                
+                # Total 3D speed (magnitude only, no direction hence speed)
+                speed = np.sqrt(velo_X**2 + velo_Y**2 + velo_Z**2)
+                
+                velocities.append({"frame1": frame1_num,"frame2": frame2_num,"vx_mps": velo_X,"vy_mps": velo_Y,"vz_mps": velo_Z,"speed_mps": speed,"Z_frame1": position_1['Z'],"Z_frame2": position_2['Z']})
+        return velocities, positions_3D
+    
+    # Physics based drag model to simulate shuttlecock trajectory in 3D (Based on golf ball drag model from class)
+    @staticmethod
+    def sim_drag_model(x0, y0, z0, vx0, vy0, vz0):
+        # Simulate shuttlecock trajectory with drag model. (based on golf ball lab)
+        X0 = np.array([x0, y0, z0, vx0, vy0, vz0])  # initial state vector
+        t0 = 0.0
+        tf = 5.0  # simulate for 5 seconds (enough time to land)
+
+        # equation to be solved 
+        def dynamic_eqn(t, x):
+            return DragModel.badminton_eqns(x)
+    
+        # Define the event function (landing detection) - modified from golf ball lab code
+        def land_event(t, x):
+            return DragModel.stop_shuttle_flight(x)
+    
+        land_event.terminal = True  # Stop integration when landed on court (i.e., when we are challenging)
+        land_event.direction = -1  
+    
+        # Run simulation
+        sol = solve_ivp(
+            dynamic_eqn,
+            (t0, tf),
+            X0,
+            method='RK45',
+            events=land_event,
+            rtol=1e-5,
+            atol=1e-6,
+            dense_output=True
+        )
+
+        sim_X = sol.y[0, :]
+        sim_Y = sol.y[1, :]
+        sim_Z = sol.y[2, :]
+    
+        return sim_X, sim_Y, sim_Z, sol.t # return simulation positions and times
+    
+    @staticmethod
+    def stop_shuttle_flight(X):
+        #Event function to detect when shuttle lands (z = 0) - modified from golf ball lab code
+        return X[2]  # z position of vector
+    
+    @staticmethod
+    def badminton_eqns(X):
+        #  x(1)=X, x(2)=Y, x(3)=Z, x(4)=Vx, x(5)=Vy, x(6)=Vz,
+        xdot = np.zeros(6) # initialize derivative vector
+        g = 9.81  # gravity const in m/s^2
+        rho = 1.225 # air density in kg/m^3
+        A = 0.0032 # cross-sectional area in m^2
+        m = 0.0059 # mass of shuttlecock in kg
+        Cd = 0.60 # drag coefficient is fixed in this (values from paper discussed in our report)
+
+        speed = np.sqrt(X[3]**2 + X[4]**2 + X[5]**2) # magnitude of velocity
+
+        # Avoid division by zero which caused some errors
+        if speed < 1e-10:
+            v_hat = np.zeros(3)
+        else:
+            v_shuttle = np.array([X[3], X[4], X[5]])
+            v_hat = v_shuttle / speed  # unit vector in direction of velocity
+
+        # 6 Scalar ODEs for flight with drag
+        xdot[0] = X[3]  # dx/dt = Vx
+        xdot[1] = X[4]  # dy/dt = Vy
+        xdot[2] = X[5]  # dz/dt = Vz
+        
+        v_shuttle = np.array([X[3], X[4], X[5]])
+        v_hat = v_shuttle / speed  # unit vector in direction of velocity
+        
+        xdot[3] = -0.5 * Cd * rho * A * speed**2 * v_hat[0] / m  # ax
+        xdot[4] = -0.5 * Cd * rho * A * speed**2 * v_hat[1] / m  # ay
+        xdot[5] = -0.5 * Cd * rho * A * speed**2 * v_hat[2] / m - g # az (gravity acts in this direction)
+
+        return xdot # returns vector
+
+    @staticmethod
+    def DLT(file_path_court):
+        # DLT to project 3D into 2D pixel coordinates
+        # Equations from (https://yagmurcigdemaktas.medium.com/visual-perception-camera-calibration-9108f8be789)
+        court_data = DragModel.load_data(file_path_court)
+        if court_data is None:
+            return None, None
+
+        court_info = court_data["court_info"] # access court info
+        net_info = court_data["net_info"] # access net info
+
+        world_points = np.array([
+            [0.46, 0, 0],      # top-left
+            [5.64, 0, 0],      # top-right
+            [0.46, 6.7, 0],    # middle-left
+            [5.64, 6.7, 0],    # middle-right
+            [0.46, 13.4, 0],   # bottom-left
+            [5.64, 13.4, 0],   # bottom-right
+            [0, 6.7, 0],    # netpole bottom-left
+            [6.1, 6.7, 0],   # netpole bottom-right
+            [0, 6.7, 1.55],   # netpole top-left
+            [6.1, 6.7, 1.55]  # netpole top-right
+        ], dtype=np.float32)
+
+        pixel_points = np.array([
+            court_info[0], # top-left
+            court_info[1], # top-right
+            court_info[2], # middle-left
+            court_info[3], # middle-right
+            court_info[4], # bottom-left
+            court_info[5], # bottom-right
+            net_info[1],   # netpole bottom-left
+            net_info[2],    # netpole bottom-right
+            net_info[0],   # netpole top-left
+            net_info[3]    # netpole top-right
+        ], dtype=np.float32)    
+
+        A = [] # initialize to solve
+        for i in range(world_points.shape[0]): # for each point
+            X, Y, Z = world_points[i]
+            u, v = pixel_points[i]
+        
+            # Two equations per pixel point for DLT from linked Medium article
+            A.append([X, Y, Z, 1, 0, 0, 0, 0, -u*X, -u*Y, -u*Z, -u])
+            A.append([0, 0, 0, 0, X, Y, Z, 1, -v*X, -v*Y, -v*Z, -v])
+    
+        A = np.array(A)
+        col1, col2, V = np.linalg.svd(A) # only need the last solution row (so dont care about col1 or col2)
+        P_matrix = V[-1, :]  # Last row of V^T
+    
+        # Make into 3x4 matrix (needed for a DLT projection matrix)
+        P = P_matrix.reshape(3, 4)
+        return P
+    
+    @staticmethod
+    def project_3D_to_2D(sim_X, sim_Y, sim_Z, DLT_P): #(following Medium approach to DLT transform)
+        # sim_X,Y,Z are 1D arrays of positions
+        # DLT_P is the 3x4 projection matrix to convert 3D to 2D pixels
+        numberOfPoints = len(sim_X)
+        pixelCoordinates = np.zeros((numberOfPoints, 2))  # initialize array for pixel coordinates (u,v)
+
+        for i in range(numberOfPoints):
+            # Create 4x1 coordinates [X, Y, Z, 1]
+            CourtCoordinates = np.array([sim_X[i], sim_Y[i], sim_Z[i], 1])
+        
+            # Apply DLT projection (using @ for matrix multiplication so we can get 2D results for camera view)
+            pixelResults = DLT_P @ CourtCoordinates
+        
+            # Divide by the third coordinate to get (u, v) 
+            u = pixelResults[0]/pixelResults[2]
+            v = pixelResults[1]/pixelResults[2]
+        
+            # give us the pixel coordinates for the camera view (to compare against obsrved data)
+            pixelCoordinates[i] = [u, v]
+        return pixelCoordinates
+
+    @staticmethod
+    def fit_drag_model_to_data(positions_3D, velocities3D, frame_numbers, file_path_court, file_path_ball):
+        shuttlecock_data = DragModel.load_data(file_path_ball)
+        validPositions = {}
+        validFrames = []
+        
+        for frame in frame_numbers:
+            if frame in positions_3D:
+                position = positions_3D[frame]
+                # Keep positions that aren't just at (0,0) cause shuttlecock should be in air at most points in flight
+                # not ideal cause we lost data, but better than having a whole bunch of really noisy points
+                if not (position['X'] < 0.1 and position['Y'] < 0.1 and position['Z'] > 0.1):
+                    validPositions[frame] = position
+                    validFrames.append(frame)
+        
+        #print(f"Using {len(valid_frames)} valid frames out of {len(frame_numbers)}") # debug print
+        # Use only valid frames 
+        frame_numbers = validFrames
+        positions_3D = validPositions
+
+        # Initial position from first frame and initial velocity estimates
+        first_frame = frame_numbers[0]
+        x0 = positions_3D[first_frame]['X']
+        y0 = positions_3D[first_frame]['Y']
+        z0 = positions_3D[first_frame]['Z']
+        # average a few frames to get better estimate (ignore first couple frames where tumbling occurs)
+        vx0_estimated = np.mean([v['vx_mps'] for v in velocities3D[2:5]])
+        vy0_estimated = np.mean([v['vy_mps'] for v in velocities3D[2:5]])
+        vz0_estimated = np.mean([v['vz_mps'] for v in velocities3D[2:5]])
+        # print(vx0_estimated, vy0_estimated, vz0_estimated) # debug print for seeing if results even make sense
+
+        # Initialize lists for the observed data from camera in pixel coords
+        observed_frames = []
+        observed_u_coordinate = []
+        observed_v_coordinate = []
+        
+        for frame_num in frame_numbers: # Loop through all frames
+            # Store observed data for each frame (frame#, x, y, z)
+            if frame_num in positions_3D:
+                trajectoryData_2D = shuttlecock_data[str(frame_num)]
+                if trajectoryData_2D['visible'] == 1:
+                    observed_frames.append(frame_num)
+                    observed_u_coordinate.append(trajectoryData_2D['x'])
+                    observed_v_coordinate.append(trajectoryData_2D['y'])
+    
+        # Convert observed data to numpy arrays so we can malipulate with numpy math expression
+        observed_u_coordinate = np.array(observed_u_coordinate)
+        observed_v_coordinate = np.array(observed_v_coordinate)
+        observed_frames = np.array(observed_frames)
+        
+        # Define cost function to minimize
+        def obj_function(initial_velos):
+            # Initial velocities will be passed in
+            vx0, vy0, vz0 = initial_velos
+
+            # Run simulation with these initial velocities
+            sim_X, sim_Y, sim_Z, sim_t = DragModel.sim_drag_model(x0, y0, z0, vx0, vy0, vz0)  
+            # Convert frame numbers to time to help line up with physics model
+            fps = 30.0 # 30 for all videos we have
+            observed_times = (observed_frames - observed_frames[0])/fps # frame number become time increments (s)
+                
+            # Simulation times don't match observed times
+            # Interpolate simulation results to get values at the observed times
+            sim_X_interp = interp1d(sim_t, sim_X, kind='cubic', fill_value='extrapolate')
+            sim_Y_interp = interp1d(sim_t, sim_Y, kind='cubic', fill_value='extrapolate')
+            sim_Z_interp = interp1d(sim_t, sim_Z, kind='cubic', fill_value='extrapolate')
+                
+            # Evaluate the simulation times at the exact observed times (using interpolation results)
+            sim_XatFrames = sim_X_interp(observed_times)
+            sim_YatFrames = sim_Y_interp(observed_times)
+            sim_ZatFrames = sim_Z_interp(observed_times)
+                
+            # Calculate mean squared error between observed and simulated positions (what we are minimizing)
+            DLT_P = DragModel.DLT(file_path_court)
+            pixel_coords_sim = DragModel.project_3D_to_2D(sim_XatFrames, sim_YatFrames, sim_ZatFrames, DLT_P)
+            sim_u = pixel_coords_sim[:, 0]
+            sim_v = pixel_coords_sim[:, 1]
+
+            # errors between simulated pixel position and what we observe with SoloSHuttlePose 
+            error_u = np.mean((sim_u - observed_u_coordinate)**2)
+            error_v = np.mean((sim_v - observed_v_coordinate)**2)
+            trajectory_error = error_u + error_v # add error from each pixel coordinate
+
+            # Add penalty for final position mismatch (it should land close to observed final position)
+            # This means the code will only work for shots that actually hit the ground (limitation)
+            final_u_error = (sim_u[-1] - observed_u_coordinate[-1])**2
+            final_v_error = (sim_v[-1] - observed_v_coordinate[-1])**2
+            landing_penalty = np.sqrt(final_u_error + final_v_error) # landing error as distanc in pixels
+
+            # Penalty for peak height difference (trying to fix issue with height overestimation)
+            observed_v_max = min(observed_v_coordinate) # v is down in camera view so min is actually max
+            sim_v_max = np.min(sim_v)
+            peak_penalty = np.sqrt((sim_v_max - observed_v_max)**2)
+
+            total_error = trajectory_error + 0.5 * landing_penalty + 0.2 * peak_penalty # sum all errors with experimental weights       
+            return total_error
+        
+        # We use this as initial guess for optimization solver (based on average outside of tumbling)
+        initial_guess = [vx0_estimated, vy0_estimated, vz0_estimated]
+        
+        # Optimization bounds used (assuming more velocity in xy than z):
+        # x and y around +/- 360 km/h, z around +/- 180 km/h
+        bounds = [(-100.0, 100.0),(-100.0, 100.0),(-50.0, 50.0)]
+        print(f"Initial Badminton Court Position (X,Y,Z): ({x0:.2f}, {y0:.2f}, {z0:.2f})") # debug print - help if initial position is in other court half
+        print(f"Estimated velocity: ({vx0_estimated:.2f}, {vy0_estimated:.2f}, {vz0_estimated:.2f})") # debug print if it make sense
+        
+        # Run optimization solver to minimize error in trajectory/landing while finding best initial speeds/velo
+        #L-BFGS-B was recommended for bounded problems in scipy documentation (don't want to display right now)
+        resultOfOptimization = minimize(obj_function,initial_guess,method='L-BFGS-B',bounds=bounds,options={'maxiter': 500, 'disp': False} )
+        
+        # Optimal initial velocities to minimize error
+        vx0_opt, vy0_opt, vz0_opt = resultOfOptimization.x
+        # will return this dictionary of results from optimization so we can aaccess easily later on
+        optimal_params = {'Cd': 0.6,'vx0': vx0_opt,'vy0': vy0_opt,'vz0': vz0_opt,'x0': x0,'y0': y0,'z0': z0}
+        print("\nOptimal parameters found via optimization:")
+        print(f"  Initial velocity: ({vx0_opt:.2f}, {vy0_opt:.2f}, {vz0_opt:.2f}) m/s")
+        print(f"  Final error: {resultOfOptimization.fun:.6f}") # in pixels
+        
+        # Generate fitted trajectory using optimized velos
+        sim_X, sim_Y, sim_Z, _ = DragModel.sim_drag_model(x0, y0, z0, vx0_opt, vy0_opt, vz0_opt)
+        return optimal_params, (sim_X, sim_Y, sim_Z)
+    
+    @staticmethod
+    def plot_trajectory_2D(sim_X, sim_Y, sim_Z, file_path_court, observed_pixels=None, title="Trajectory in Camera View"):
+        # Load court data and net data from SoloShuttlePose json file formatting
+        court_data = DragModel.load_data(file_path_court)
+        courtPoints = court_data["court_info"]
+        netPoints = court_data["net_info"]
+        
+        # Project trajectory to 2D using DLT matrix functions we already created
+        P = DragModel.DLT(file_path_court)
+        pixel_coords = DragModel.project_3D_to_2D(sim_X, sim_Y, sim_Z, P) #2D pixel coords for camera view
+        
+        # Create plot to show court and trajctory
+        plt.figure(figsize=(14, 8))
+        
+        # Draw court lines to show the court boundaries as seen from camera's perspective
+        court_Keypoints = [courtPoints[0], courtPoints[1], courtPoints[5], courtPoints[4], courtPoints[0]] # corners
+        court_x = [p[0] for p in court_Keypoints]
+        court_y = [p[1] for p in court_Keypoints]
+        plt.plot(court_x, court_y, 'g-', linewidth=2, label='Court boundary')
+        
+        # Centre line to show each side of the court
+        plt.plot([courtPoints[2][0], courtPoints[3][0]],[courtPoints[2][1], courtPoints[3][1]],'g-', linewidth=2, label='Centre')
+        
+        # Top of net to show how high a shot must be to clear (~1.55metres)
+        plt.plot([netPoints[0][0], netPoints[3][0]],[netPoints[0][1], netPoints[3][1]], 'k-', linewidth=2, label='Net')
+        
+        # Plot observed trajectory from SoloShuttlePose (2D)
+        plt.plot(observed_pixels[:, 0], observed_pixels[:, 1], 'ro-', linewidth=2, label='Observed(camera) trajectory')
+        
+        # Plot simulated trajectory from our drag model projected into camera frame
+        plt.plot(pixel_coords[:, 0], pixel_coords[:, 1], 'b-', linewidth=2, label='Simulated trajectory')
+        
+        # Mark start and end of each shot to show where it gets hit and lands (helps with high lvel debuging)
+        plt.scatter(pixel_coords[0, 0], pixel_coords[0, 1], c='lime', marker='o', linewidths=2, label='Start')
+        plt.scatter(pixel_coords[-1, 0], pixel_coords[-1, 1], c='red', marker='x', linewidths=3, label='Landing')
+        
+        # Labe graph to make it clear this is pixels
+        plt.xlabel('u (pixels)')
+        plt.ylabel('v (pixels)')
+        plt.title(title)
+        plt.legend()
+        plt.gca().invert_yaxis() # our y is flipped so this match data
+        plt.tight_layout()
+        plt.show()
+
+##### Testing one data we obtained from TrackNetV2 cause our own videos weren't being processed properly by SoloShuttlePose repo
+if __name__ == "__main__":
+    # Adjust depending on the desired test data
+    file_path_ball = 'res/ball/loca_info(denoise)/test2/test2_Gavin2.json'
+    file_path_court = 'res/courts/court_kp/test2.json'
+
+    # Get 3D velocities and positions (assumes 30fps for all our videos)
+    [velocities3D, positions_3D] = DragModel.get_velocity_worlds(file_path_ball, file_path_court, fps=30.0)
+    
+    ### Project simulated 3D trajectory to 2D pixel coordinates (i.e., camera view) ###
+    # Get frame numbers for fitting
+    shuttlecock_data = DragModel.load_data(file_path_ball)
+    frame_numbers = sorted([int(k) for k in shuttlecock_data.keys()])
+
+    # Get observed pixel coordinates
+    observedCamera_pixels = []
+    for frame_num in frame_numbers:
+        trajectoryData_2D = shuttlecock_data[str(frame_num)]
+        if trajectoryData_2D['visible'] == 1:
+            observedCamera_pixels.append([trajectoryData_2D['x'], trajectoryData_2D['y']])
+    # convert to numpy array so we can use numpys matth experessions
+    observedCamera_pixels = np.array(observedCamera_pixels)
+
+    # Fit drag model to observed data (double check loaded correct data --> i.e., court file, ball file is denoise from SoloShuttlePose)
+    optimal_params, (sim_X_fit,sim_Y_fit,sim_Z_fit) = DragModel.fit_drag_model_to_data(positions_3D,velocities3D,frame_numbers,file_path_court,file_path_ball)
+
+    # Plot fitted trajectory in 2D camera view
+    DragModel.plot_trajectory_2D(sim_X_fit, sim_Y_fit, sim_Z_fit, file_path_court, observed_pixels=observedCamera_pixels,title="Fitted Drag Model vs. Observed Trajectory")
+
+    ## Plot in 3D using the 3D trajectory to see if it makes sense in real world coordinates
+    plt.figure()
+    ax = plt.subplot(2, 2, 1, projection='3d')
+    ax.plot(sim_X_fit, sim_Y_fit, sim_Z_fit, 'b-', linewidth=2)
+    ax.scatter(sim_X_fit[0], sim_Y_fit[0], sim_Z_fit[0], c='g', marker='o', label='Start') # show start
+    ax.scatter(sim_X_fit[-1], sim_Y_fit[-1], sim_Z_fit[-1], c='r', marker='x', label='End') # show end (land)
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title('3D Trajectory')
+    ax.legend()
+    ax.grid(True)
+    plt.show()
